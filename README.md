@@ -1,6 +1,8 @@
 <img width="2048" height="1698" alt="logo" src="https://github.com/user-attachments/assets/64a222a0-a8c3-4af3-84b5-95a2ee2cc159" />
 # Pump.fun Automatic Buyback Bot
+
 Token CBB: By8DkWdieCm4dN34Nu6G3Tb8WoMqAZ7ED1Y9gvYcpump
+
 An open-source bot that automatically claims creator fees from pump.fun and uses them to buy back your token. Perfect for meme token creators who want to support their token price by reinvesting trading fees.
 
 ## Features
