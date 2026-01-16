@@ -1,9 +1,10 @@
 import {
   PublicKey,
-  TransactionInstruction,
-  SystemProgram,
+  Transaction,
+  VersionedTransaction,
   LAMPORTS_PER_SOL,
 } from '@solana/web3.js';
+import axios from 'axios';
 import { WalletManager } from '../utils/wallet';
 import { PUMPFUN_CONSTANTS, BotConfig } from '../config';
 import { logger } from '../utils/logger';
@@ -21,12 +22,23 @@ interface BondingCurveData {
 }
 
 /**
- * PumpFun service for interacting with pump.fun protocol
+ * PumpPortal API response for transaction
+ */
+interface PumpPortalResponse {
+  transaction?: string;
+  error?: string;
+}
+
+/**
+ * PumpFun service for interacting with pump.fun protocol via PumpPortal API
  */
 export class PumpFunService {
   private wallet: WalletManager;
   private config: BotConfig;
   private tokenMint: PublicKey;
+
+  // PumpPortal API endpoint
+  private readonly PUMPPORTAL_API = 'https://pumpportal.fun/api/trade-local';
 
   constructor(wallet: WalletManager, config: BotConfig) {
     this.wallet = wallet;
@@ -41,20 +53,6 @@ export class PumpFunService {
     const [pda] = PublicKey.findProgramAddressSync(
       [
         Buffer.from(PUMPFUN_CONSTANTS.BONDING_CURVE_SEED),
-        this.tokenMint.toBuffer(),
-      ],
-      PUMPFUN_CONSTANTS.PROGRAM_ID
-    );
-    return pda;
-  }
-
-  /**
-   * Derive the creator vault PDA for claiming fees
-   */
-  getCreatorVaultPDA(): PublicKey {
-    const [pda] = PublicKey.findProgramAddressSync(
-      [
-        Buffer.from(PUMPFUN_CONSTANTS.CREATOR_VAULT_SEED),
         this.tokenMint.toBuffer(),
       ],
       PUMPFUN_CONSTANTS.PROGRAM_ID
@@ -79,74 +77,187 @@ export class PumpFunService {
   }
 
   /**
-   * Check claimable creator fees from the creator vault
+   * Check claimable creator fees using pump.fun website API
+   * Note: This checks all fees across all tokens created by this wallet
    */
   async getClaimableFees(): Promise<number> {
     try {
-      const creatorVault = this.getCreatorVaultPDA();
-      const connection = this.wallet.getConnection();
+      const walletAddress = this.wallet.getPublicKey().toBase58();
 
-      // Get the balance of the creator vault
-      const balance = await connection.getBalance(creatorVault);
+      // Try to get fee info from pump.fun API
+      const response = await axios.get(
+        `https://frontend-api.pump.fun/creators/${walletAddress}/fees`,
+        {
+          headers: {
+            'Accept': 'application/json',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          },
+          timeout: 10000,
+        }
+      );
 
-      // Subtract rent-exempt minimum (approximately 0.00089 SOL for the account)
-      const rentExempt = await connection.getMinimumBalanceForRentExemption(0);
-      const claimable = Math.max(0, balance - rentExempt);
+      if (response.data && typeof response.data.claimable === 'number') {
+        const claimableSol = response.data.claimable / LAMPORTS_PER_SOL;
+        logger.debug(`Claimable fees from API: ${claimableSol} SOL`);
+        return claimableSol;
+      }
 
-      logger.debug(`Creator vault balance: ${balance / LAMPORTS_PER_SOL} SOL`);
-      logger.debug(`Claimable fees: ${claimable / LAMPORTS_PER_SOL} SOL`);
-
-      return claimable / LAMPORTS_PER_SOL;
+      // Fallback: return -1 to indicate we should try claiming anyway
+      logger.debug('Could not fetch claimable fees, will attempt claim');
+      return -1;
     } catch (error) {
-      logger.error('Failed to get claimable fees:', error);
-      return 0;
+      // API might not be available, try claiming anyway
+      logger.debug('Fee check API not available, will attempt claim');
+      return -1;
     }
   }
 
   /**
-   * Claim accumulated creator fees from pump.fun
-   *
-   * Note: This creates the instruction to withdraw fees from the creator vault
+   * Claim accumulated creator fees from pump.fun using PumpPortal API
+   * Note: pump.fun claims ALL fees at once, not per-token
    */
-  async claimFees(): Promise<string | null> {
+  async claimFees(): Promise<{ signature: string; amount: number } | null> {
     try {
-      const claimableSol = await this.getClaimableFees();
+      logger.info('Attempting to claim creator fees via PumpPortal API...');
 
-      if (claimableSol < 0.001) {
-        logger.info('No significant fees to claim (less than 0.001 SOL)');
-        return null;
+      // Get transaction from PumpPortal
+      const response = await axios.post<string>(
+        this.PUMPPORTAL_API,
+        {
+          publicKey: this.wallet.getPublicKey().toBase58(),
+          action: 'collectCreatorFee',
+          pool: 'pump',
+          priorityFee: this.config.usePriorityFee
+            ? this.config.priorityFeeMicroLamports / 1_000_000
+            : 0.0001,
+        },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          responseType: 'arraybuffer',
+          timeout: 30000,
+        }
+      );
+
+      // Decode the transaction
+      const txBuffer = Buffer.from(response.data);
+
+      // Try to deserialize as VersionedTransaction first
+      let signature: string;
+      const connection = this.wallet.getConnection();
+      const balanceBefore = await connection.getBalance(this.wallet.getPublicKey());
+
+      try {
+        const versionedTx = VersionedTransaction.deserialize(txBuffer);
+        versionedTx.sign([this.wallet.getKeypair()]);
+        signature = await connection.sendTransaction(versionedTx, {
+          skipPreflight: false,
+          preflightCommitment: 'confirmed',
+        });
+      } catch {
+        // Fallback to legacy transaction
+        const legacyTx = Transaction.from(txBuffer);
+        legacyTx.sign(this.wallet.getKeypair());
+        signature = await connection.sendRawTransaction(legacyTx.serialize(), {
+          skipPreflight: false,
+          preflightCommitment: 'confirmed',
+        });
       }
 
-      logger.info(`Attempting to claim ${claimableSol.toFixed(6)} SOL in fees...`);
+      // Wait for confirmation
+      await connection.confirmTransaction(signature, 'confirmed');
 
-      const creatorVault = this.getCreatorVaultPDA();
-      const bondingCurve = this.getBondingCurvePDA();
+      // Calculate claimed amount
+      const balanceAfter = await connection.getBalance(this.wallet.getPublicKey());
+      const claimedAmount = (balanceAfter - balanceBefore) / LAMPORTS_PER_SOL;
 
-      // Create the claim instruction
-      // Pump.fun uses instruction discriminator for withdraw_creator_fees
-      const discriminator = Buffer.from([
-        0x1a, 0x5b, 0x8c, 0x4d, 0x9e, 0x2f, 0x7a, 0x3b // withdraw_creator_fees discriminator
-      ]);
-
-      const instruction = new TransactionInstruction({
-        programId: PUMPFUN_CONSTANTS.PROGRAM_ID,
-        keys: [
-          { pubkey: this.wallet.getPublicKey(), isSigner: true, isWritable: true }, // creator
-          { pubkey: this.tokenMint, isSigner: false, isWritable: false }, // mint
-          { pubkey: bondingCurve, isSigner: false, isWritable: true }, // bonding_curve
-          { pubkey: creatorVault, isSigner: false, isWritable: true }, // creator_vault
-          { pubkey: SystemProgram.programId, isSigner: false, isWritable: false }, // system_program
-        ],
-        data: discriminator,
-      });
-
-      const signature = await this.wallet.sendTransaction([instruction]);
-      logger.success(`Fees claimed successfully!`);
+      logger.success(`Fees claimed successfully! Amount: ~${claimedAmount.toFixed(6)} SOL`);
       logger.tx('Claim transaction', signature);
 
+      return { signature, amount: Math.max(0, claimedAmount) };
+    } catch (error: any) {
+      if (error.response) {
+        const errorText = Buffer.from(error.response.data).toString();
+        if (errorText.includes('no fees') || errorText.includes('No fees')) {
+          logger.info('No fees available to claim');
+          return null;
+        }
+        logger.error('PumpPortal API error:', errorText);
+      } else {
+        logger.error('Failed to claim fees:', error.message || error);
+      }
+      return null;
+    }
+  }
+
+  /**
+   * Buy tokens using PumpPortal API
+   */
+  async buyTokens(solAmount: number): Promise<string | null> {
+    try {
+      logger.info(`Buying tokens with ${solAmount.toFixed(6)} SOL via PumpPortal API...`);
+
+      // Get transaction from PumpPortal
+      const response = await axios.post<string>(
+        this.PUMPPORTAL_API,
+        {
+          publicKey: this.wallet.getPublicKey().toBase58(),
+          action: 'buy',
+          mint: this.tokenMint.toBase58(),
+          amount: solAmount,
+          denominatedInSol: 'true',
+          slippage: this.config.slippageBps / 100, // Convert bps to percentage
+          priorityFee: this.config.usePriorityFee
+            ? this.config.priorityFeeMicroLamports / 1_000_000
+            : 0.0001,
+          pool: 'pump',
+        },
+        {
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          responseType: 'arraybuffer',
+          timeout: 30000,
+        }
+      );
+
+      // Decode the transaction
+      const txBuffer = Buffer.from(response.data);
+      const connection = this.wallet.getConnection();
+      let signature: string;
+
+      try {
+        const versionedTx = VersionedTransaction.deserialize(txBuffer);
+        versionedTx.sign([this.wallet.getKeypair()]);
+        signature = await connection.sendTransaction(versionedTx, {
+          skipPreflight: false,
+          preflightCommitment: 'confirmed',
+        });
+      } catch {
+        // Fallback to legacy transaction
+        const legacyTx = Transaction.from(txBuffer);
+        legacyTx.sign(this.wallet.getKeypair());
+        signature = await connection.sendRawTransaction(legacyTx.serialize(), {
+          skipPreflight: false,
+          preflightCommitment: 'confirmed',
+        });
+      }
+
+      // Wait for confirmation
+      await connection.confirmTransaction(signature, 'confirmed');
+
+      logger.success(`Tokens purchased successfully!`);
+      logger.tx('Buy transaction', signature);
+
       return signature;
-    } catch (error) {
-      logger.error('Failed to claim fees:', error);
+    } catch (error: any) {
+      if (error.response) {
+        const errorText = Buffer.from(error.response.data).toString();
+        logger.error('PumpPortal API error:', errorText);
+      } else {
+        logger.error('Failed to buy tokens:', error.message || error);
+      }
       return null;
     }
   }
